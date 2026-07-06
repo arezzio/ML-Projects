@@ -1,0 +1,8 @@
+[project]
+name = "ml-projects"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas-stubs~=2.3.3",
+    "scipy-stubs~=1.15.3",
+]
