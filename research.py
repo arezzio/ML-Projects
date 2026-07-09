@@ -1144,6 +1144,154 @@ def add_equity_curve(trades: pl.DataFrame, initial_capital: float, col_name: str
         (initial_capital + pl.col(col_name).cum_sum()).alias(f'equity_curve_{suffix}')
     )
 
+def walk_forward_folds(df: pl.DataFrame, n_folds: int, min_train_frac: float = 0.5) -> List[Tuple[pl.DataFrame, pl.DataFrame]]:
+    """
+    Expanding-window walk-forward folds: each fold trains on everything up to
+    a point in time and tests on the next chunk immediately after it, so no
+    fold's test period is ever seen during that fold's training or feature
+    selection.
+
+    Returns a list of (train_df, test_df) pairs in chronological order.
+    """
+    n = len(df)
+    min_train = int(n * min_train_frac)
+    remaining = n - min_train
+    fold_size = max(1, remaining // n_folds)
+
+    folds = []
+    for i in range(n_folds):
+        train_end = min_train + i * fold_size
+        test_end = train_end + fold_size if i < n_folds - 1 else n
+        if train_end >= test_end:
+            continue
+        folds.append((df[:train_end], df[train_end:test_end]))
+    return folds
+
+
+def select_best_linear_features(
+    df: pl.DataFrame, target: str, feature_pool: List[str], annualized_rate: float,
+    max_no_features: int = 3, loss=None, no_epochs: int = 200, test_size: float = 0.25
+) -> List[str]:
+    """Runs benchmark_linear_models on df and returns the top feature combo by Sharpe."""
+    benchmark = benchmark_linear_models(
+        df, target, feature_pool, annualized_rate,
+        max_no_features=max_no_features, no_epochs=no_epochs, loss=loss, test_size=test_size
+    )
+    return benchmark.row(0, named=True)['features'].split(',')
+
+
+def walk_forward_eval(
+    df: pl.DataFrame, target: str, feature_pool: List[str], annualized_rate: float,
+    n_folds: int = 5, min_train_frac: float = 0.5, loss=None, no_epochs: int = 200,
+    max_no_features: int = 3
+) -> Tuple[pl.DataFrame, torch.Tensor, torch.Tensor]:
+    """
+    True out-of-sample walk-forward validation. For each fold: picks the best
+    feature combo using ONLY that fold's training data (via
+    select_best_linear_features), trains a fresh model on that training data,
+    then evaluates once on the held-out test data that was never used for
+    feature selection or training.
+
+    Returns:
+        - a DataFrame with one row of performance stats per fold
+        - the concatenated out-of-sample y_true across all folds, in order
+        - the concatenated out-of-sample y_hat across all folds, in order
+    These concatenated tensors form a single stitched-together OOS equity
+    curve spanning the whole walk-forward period.
+    """
+    folds = walk_forward_folds(df, n_folds, min_train_frac)
+
+    fold_perfs = []
+    all_y_test = []
+    all_y_hat = []
+
+    for i, (train_df, test_df) in enumerate(folds):
+        best_features = select_best_linear_features(
+            train_df, target, feature_pool, annualized_rate,
+            max_no_features=max_no_features, loss=loss, no_epochs=no_epochs
+        )
+
+        model = models_module().LinearModel(len(best_features))
+
+        X_train = to_tensor(train_df[best_features])
+        y_train = to_tensor(train_df[target]).reshape(-1, 1)
+        X_test = to_tensor(test_df[best_features])
+        y_test = to_tensor(test_df[target]).reshape(-1, 1)
+
+        y_hat = batch_train_reg(model, X_train, X_test, y_train, y_test, no_epochs, criterion=loss, logging=False)
+
+        perf = eval_model_performance(y_test, y_hat, best_features, target, annualized_rate)
+        perf['fold'] = i
+        perf['no_test_obs'] = len(test_df)
+        fold_perfs.append(perf)
+
+        all_y_test.append(y_test)
+        all_y_hat.append(y_hat)
+
+    combined_y_test = torch.cat(all_y_test)
+    combined_y_hat = torch.cat(all_y_hat)
+
+    return pl.DataFrame(fold_perfs), combined_y_test, combined_y_hat
+
+
+def models_module():
+    import models
+    return models
+
+
+def buy_and_hold_performance(y_true: torch.Tensor, annualized_rate: float) -> Dict[str, any]:
+    """
+    Baseline: always long, no model involved. y_true is the realized log
+    return each period; the "trade log return" each period IS the raw asset
+    log return since we hold it unconditionally.
+    """
+    returns = y_true.detach().cpu().numpy().flatten()
+    equity_curve = np.cumsum(returns)
+    drawdown = equity_curve - np.maximum.accumulate(equity_curve)
+    std = returns.std()
+    sharpe = (returns.mean() / std * annualized_rate) if std > 0 else 0.0
+    return {
+        'strategy': 'buy_and_hold',
+        'no_periods': len(returns),
+        'total_log_return': float(returns.sum()),
+        'compound_return': float(np.exp(returns.sum())),
+        'std': float(std),
+        'max_drawdown': float(drawdown.min()) if len(drawdown) else 0.0,
+        'sharpe': float(sharpe),
+    }
+
+
+def random_signal_sharpes(y_true: torch.Tensor, annualized_rate: float, n_trials: int = 500, seed: Optional[int] = None) -> np.ndarray:
+    """
+    Builds a null distribution of Sharpe ratios by taking random +1/-1
+    trading signals (a coin flip each period, no skill/information at all)
+    against the SAME realized returns used to evaluate the real model.
+
+    Comparing the model's actual out-of-sample Sharpe against this
+    distribution answers: "could a model with zero predictive power have
+    plausibly produced a Sharpe this high just by chance?"
+    """
+    rng = np.random.default_rng(seed)
+    returns = y_true.detach().cpu().numpy().flatten()
+
+    sharpes = np.empty(n_trials)
+    for i in range(n_trials):
+        signal = rng.choice([-1.0, 1.0], size=len(returns))
+        trade_returns = signal * returns
+        std = trade_returns.std()
+        sharpes[i] = (trade_returns.mean() / std * annualized_rate) if std > 0 else 0.0
+    return sharpes
+
+
+def sharpe_p_value(actual_sharpe: float, null_sharpes: np.ndarray) -> float:
+    """
+    One-sided p-value: fraction of the null (random-signal) distribution
+    that matches or beats the actual Sharpe. Small values (e.g. < 0.05) mean
+    the result is unlikely to be pure luck.
+    """
+    return float(np.mean(null_sharpes >= actual_sharpe))
+
+
 def add_compounding_trades(trades, capital, leverage, maker_fee, taker_fee):
     lev_capital = capital * leverage
     # calculate entry and exit trade value and size
